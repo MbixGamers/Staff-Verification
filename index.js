@@ -151,7 +151,9 @@ const scanResults = new Map();
 const SCAN_TTL_MS = 1000 * 60 * 10;
 const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 60000;
 const RATE_LIMIT_BACKOFF_MS = Number(process.env.RATE_LIMIT_BACKOFF_MS) || 4000;
-const NOT_IN_GUILD_DELAY_MS = Number(process.env.NOT_IN_GUILD_DELAY_MS) || 3000;
+const RETRY_AFTER_EXTRA_MS = Number(process.env.RETRY_AFTER_EXTRA_MS) || 60000;
+const scanQueue = [];
+let scanRunning = false;
 
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const adminSessions = new Map();
@@ -293,7 +295,7 @@ const fetchGuildMemberWithRetry = async (accessToken, guildId, onRateLimit) => {
             const retryAfter = err.response?.data?.retry_after;
             if (status === 429) {
                 const baseWaitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
-                const waitMs = baseWaitMs + extraBackoff;
+                const waitMs = baseWaitMs + extraBackoff + RETRY_AFTER_EXTRA_MS;
                 console.warn(`Rate limited reading guild ${guildId}. Waiting ${waitMs}ms before retry.`);
                 if (typeof onRateLimit === 'function') {
                     onRateLimit(waitMs);
@@ -312,6 +314,24 @@ const scheduleScanCleanup = (scanId) => {
     setTimeout(() => {
         scanResults.delete(scanId);
     }, SCAN_TTL_MS);
+};
+
+const processScanQueue = async () => {
+    if (scanRunning) return;
+    const next = scanQueue.shift();
+    if (!next) return;
+    scanRunning = true;
+    try {
+        await next.runScan();
+    } finally {
+        scanRunning = false;
+        processScanQueue();
+    }
+};
+
+const enqueueScan = (runScan) => {
+    scanQueue.push({ runScan });
+    processScanQueue();
 };
 
 app.get('/', (req, res) => {
@@ -1265,7 +1285,7 @@ app.get('/callback', async (req, res) => {
         const scanId = crypto.randomBytes(16).toString('hex');
         const currentTargets = getTargetServers();
         scanResults.set(scanId, {
-            state: 'running',
+            state: 'queued',
             total: currentTargets.length,
             checked: 0,
             current: null
@@ -1323,7 +1343,6 @@ app.get('/callback', async (req, res) => {
                     const status = err.response?.status;
                     if (status === 404) {
                         console.log(`User not in guild ${target.guildId}`);
-                        await sleep(NOT_IN_GUILD_DELAY_MS);
                     } else {
                         console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
                         failedServers.push({
@@ -1418,10 +1437,10 @@ app.get('/callback', async (req, res) => {
             }
         };
 
-        runScan().catch((scanErr) => {
+        enqueueScan(() => runScan().catch((scanErr) => {
             console.error('Error during verification:', scanErr.response?.data || scanErr.message);
             scanResults.set(scanId, { state: 'error' });
-        });
+        }));
 
         return res.send(`
             <html>
@@ -1513,11 +1532,13 @@ app.get('/callback', async (req, res) => {
                                 const res = await fetch('/scan-status/' + scanId);
                                 if (!res.ok) return setTimeout(poll, 1500);
                                 const data = await res.json();
-                                if (progressEl && (data.state === 'running' || data.state === 'paused')) {
+                                if (progressEl && (data.state === 'running' || data.state === 'paused' || data.state === 'queued')) {
                                     const total = Number(data.total || 0);
                                     const checked = Number(data.checked || 0);
                                     const current = data.current ? 'Checking: ' + data.current : 'Scanning...';
-                                    if (data.state === 'paused') {
+                                    if (data.state === 'queued') {
+                                        progressEl.textContent = 'Queued. Waiting for other scans to finish.';
+                                    } else if (data.state === 'paused') {
                                         const resumeAt = Number(data.resumeAt || 0);
                                         const waitSeconds = resumeAt > Date.now()
                                             ? Math.ceil((resumeAt - Date.now()) / 1000)
