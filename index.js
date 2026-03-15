@@ -76,6 +76,11 @@ const saveTargetServers = (servers) => {
 
 let targetServers = loadTargetServers();
 
+const getTargetServers = () => {
+    targetServers = loadTargetServers();
+    return targetServers;
+};
+
 // USER IDS TO DM WITH VERIFICATION STATUS
 const DEFAULT_DM_RECIPIENTS = [
     '928635423465537579',
@@ -144,7 +149,8 @@ let channelRecipients = loadChannelRecipients();
 const channelSendStatus = new Map();
 const scanResults = new Map();
 const SCAN_TTL_MS = 1000 * 60 * 10;
-const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 700;
+const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 5000;
+const RATE_LIMIT_BACKOFF_MS = Number(process.env.RATE_LIMIT_BACKOFF_MS) || 4000;
 
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const adminSessions = new Map();
@@ -271,8 +277,9 @@ const recordChannelStatus = (channelId, ok, error) => {
     });
 };
 
-const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3, onRateLimit) => {
+const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 5, onRateLimit) => {
     const memberUrl = `https://discord.com/api/users/@me/guilds/${guildId}/member`;
+    let extraBackoff = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             const response = await axios.get(memberUrl, {
@@ -283,12 +290,14 @@ const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3, 
             const status = err.response?.status;
             const retryAfter = err.response?.data?.retry_after;
             if (status === 429) {
-                const waitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
+                const baseWaitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
+                const waitMs = baseWaitMs + extraBackoff;
                 console.warn(`Rate limited reading guild ${guildId}. Waiting ${waitMs}ms before retry.`);
                 if (typeof onRateLimit === 'function') {
                     onRateLimit(waitMs);
                 }
                 await sleep(waitMs);
+                extraBackoff = Math.min(RATE_LIMIT_BACKOFF_MS * attempt, 10000);
                 continue;
             }
             throw err;
@@ -419,7 +428,7 @@ app.get('/', (req, res) => {
                 <div class="card">
                     <h1>Staff Verification</h1>
                     <p>Verify your roster status across approved servers and receive an instant result.</p>
-                    <p style="margin-top:8px;">Note: This action can take 8-10 minutes or longer due to Discord rate limits.</p>
+                    <p style="margin-top:8px;">Note: This action can take 15+ minutes due to Discord rate limits.</p>
                     <a class="button" href="/login">Login with Discord</a>
                     <div class="footer">Secure OAuth2 verification</div>
                 </div>
@@ -1069,10 +1078,11 @@ app.post('/admin/logout', (req, res) => {
 });
 
 app.get('/admin/servers', requireAdmin, (req, res) => {
-    return res.json(targetServers);
+    return res.json(getTargetServers());
 });
 
 app.post('/admin/servers', requireAdmin, (req, res) => {
+    targetServers = getTargetServers();
     const { guildId, name } = req.body || {};
     const cleanId = String(guildId || '').trim();
     const cleanName = String(name || '').trim();
@@ -1089,6 +1099,7 @@ app.post('/admin/servers', requireAdmin, (req, res) => {
 });
 
 app.delete('/admin/servers', requireAdmin, (req, res) => {
+    targetServers = getTargetServers();
     const { guildId } = req.body || {};
     const cleanId = String(guildId || '').trim();
     if (!cleanId) {
@@ -1104,6 +1115,7 @@ app.delete('/admin/servers', requireAdmin, (req, res) => {
 });
 
 app.post('/admin/roles', requireAdmin, (req, res) => {
+    targetServers = getTargetServers();
     const { guildId, roleId } = req.body || {};
     const cleanGuildId = String(guildId || '').trim();
     const cleanRoleId = String(roleId || '').trim();
@@ -1122,6 +1134,7 @@ app.post('/admin/roles', requireAdmin, (req, res) => {
 });
 
 app.delete('/admin/roles', requireAdmin, (req, res) => {
+    targetServers = getTargetServers();
     const { guildId, roleId } = req.body || {};
     const cleanGuildId = String(guildId || '').trim();
     const cleanRoleId = String(roleId || '').trim();
@@ -1250,9 +1263,10 @@ app.get('/callback', async (req, res) => {
 
         const accessToken = tokenResponse.data.access_token;
         const scanId = crypto.randomBytes(16).toString('hex');
+        const currentTargets = getTargetServers();
         scanResults.set(scanId, {
             state: 'running',
-            total: targetServers.length,
+            total: currentTargets.length,
             checked: 0,
             current: null
         });
@@ -1260,6 +1274,7 @@ app.get('/callback', async (req, res) => {
 
         const runScan = async () => {
             const rosteredServers = [];
+            const failedServers = [];
             let userTag = 'unknown user';
             let userId = 'unknown';
 
@@ -1274,11 +1289,11 @@ app.get('/callback', async (req, res) => {
             }
 
             let checked = 0;
-            for (const target of targetServers) {
+            for (const target of currentTargets) {
                 const currentLabel = target.name || target.guildId;
                 scanResults.set(scanId, {
                     state: 'running',
-                    total: targetServers.length,
+                    total: currentTargets.length,
                     checked,
                     current: currentLabel
                 });
@@ -1307,17 +1322,22 @@ app.get('/callback', async (req, res) => {
                     }
                 } catch (err) {
                     const status = err.response?.status;
-                    if (status && status !== 404) {
-                        console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
-                    } else {
+                    if (status === 404) {
                         console.log(`User not in guild ${target.guildId}`);
+                    } else {
+                        console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
+                        failedServers.push({
+                            name: target.name || 'Unknown Server',
+                            guildId: target.guildId,
+                            status: status || 'unknown'
+                        });
                     }
                 }
                 await sleep(GUILD_SCAN_DELAY_MS);
                 checked += 1;
                 scanResults.set(scanId, {
                     state: 'running',
-                    total: targetServers.length,
+                    total: currentTargets.length,
                     checked,
                     current: currentLabel
                 });
@@ -1332,21 +1352,33 @@ app.get('/callback', async (req, res) => {
             }
             const isDoubleRostered = uniqueRostered.length >= 2;
 
+            const hasFailures = failedServers.length > 0;
+            const failedList = failedServers.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
             const dmServerList = uniqueRostered.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
-            const statusMessage = isDoubleRostered
-                ? `⚠️ WARNING: **${userTag}** (${userId}) was double rostering in: ${dmServerList}`
-                : `✅ Verification successful for ${userTag} (${userId}). No double rostering found.`;
+            const statusMessage = hasFailures
+                ? `⚠️ Verification incomplete for **${userTag}** (${userId}). Could not verify: ${failedList}`
+                : (uniqueRostered.length > 0
+                    ? (isDoubleRostered
+                        ? `⚠️ WARNING: **${userTag}** (${userId}) is rostered in multiple servers: ${dmServerList}`
+                        : `✅ Verification complete for ${userTag} (${userId}). Rostered in: ${dmServerList}`)
+                    : `✅ Verification complete for ${userTag} (${userId}). Not rostered in any target server.`);
 
-            const resultTitle = isDoubleRostered ? 'Verification Warning' : 'Verification Successful';
-            const resultBody = isDoubleRostered
-                ? `⚠️ Double rostering detected in:<br>${uniqueRostered
+            const resultTitle = hasFailures
+                ? 'Verification Incomplete'
+                : (isDoubleRostered ? 'Verification Warning' : 'Verification Complete');
+            const resultBody = hasFailures
+                ? `⚠️ Some servers could not be verified:<br>${failedServers
                       .map(v => `<b>${v.name}</b> (${v.guildId})`)
                       .join('<br>')}`
-                : (uniqueRostered.length === 1
-                    ? `✅ No double rostering found.<br>Rostered in:<br>${uniqueRostered
-                          .map(v => `<b>${v.name}</b> (${v.guildId})`)
-                          .join('<br>')}`
-                    : '✅ No double rostering found.');
+                : (uniqueRostered.length > 0
+                    ? (isDoubleRostered
+                        ? `⚠️ Rostered in multiple servers:<br>${uniqueRostered
+                              .map(v => `<b>${v.name}</b> (${v.guildId})`)
+                              .join('<br>')}`
+                        : `✅ Rostered in:<br>${uniqueRostered
+                              .map(v => `<b>${v.name}</b> (${v.guildId})`)
+                              .join('<br>')}`)
+                    : '✅ Not rostered in any target server.');
 
             scanResults.set(scanId, {
                 state: 'done',
@@ -1354,8 +1386,8 @@ app.get('/callback', async (req, res) => {
                 resultTitle,
                 resultBody,
                 statusMessage,
-                total: targetServers.length,
-                checked: targetServers.length,
+                total: currentTargets.length,
+                checked: currentTargets.length,
                 current: null
             });
 
@@ -1463,7 +1495,7 @@ app.get('/callback', async (req, res) => {
                     <div class="card">
                         <h1>Scanning servers</h1>
                         <p>Please keep this tab open until the scan is completed.</p>
-                        <p style="margin-top:8px;">Note: This action can take 8-10 minutes or longer due to Discord rate limits.</p>
+                        <p style="margin-top:8px;">Note: This action can take 15+ minutes due to Discord rate limits.</p>
                         <p id="scanProgress" style="margin-top:12px;">Preparing scan…</p>
                         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
                             <div class="progress-bar" id="scanBar"></div>
