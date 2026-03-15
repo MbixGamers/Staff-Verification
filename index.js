@@ -268,6 +268,31 @@ const recordChannelStatus = (channelId, ok, error) => {
     });
 };
 
+const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3) => {
+    const memberUrl = `https://discord.com/api/users/@me/guilds/${guildId}/member`;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            const response = await axios.get(memberUrl, {
+                headers: { Authorization: `Bearer ${accessToken}` }
+            });
+            return response;
+        } catch (err) {
+            const status = err.response?.status;
+            const retryAfter = err.response?.data?.retry_after;
+            if (status === 429) {
+                const waitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
+                console.warn(`Rate limited reading guild ${guildId}. Waiting ${waitMs}ms before retry.`);
+                await sleep(waitMs);
+                continue;
+            }
+            throw err;
+        }
+    }
+    const error = new Error('Rate limited too many times.');
+    error.code = 429;
+    throw error;
+};
+
 app.get('/', (req, res) => {
     res.send(`
         <html>
@@ -467,6 +492,11 @@ app.get('/admin', (req, res) => {
                         background: rgba(255, 255, 255, 0.12);
                         color: var(--text);
                     }
+                    .btn.danger {
+                        background: rgba(244, 63, 94, 0.16);
+                        color: #fecdd3;
+                        border: 1px solid rgba(244, 63, 94, 0.5);
+                    }
                     .pill {
                         display: inline-flex;
                         align-items: center;
@@ -490,6 +520,26 @@ app.get('/admin', (req, res) => {
                     .error { padding: 10px 12px; border-radius: 10px; background: rgba(244, 63, 94, 0.15); color: var(--danger); font-size: 13px; }
                     .hidden { display: none; }
                     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+                    .server-row {
+                        display: grid;
+                        grid-template-columns: 1fr auto;
+                        gap: 12px;
+                        align-items: center;
+                        padding: 12px 14px;
+                        border-radius: 12px;
+                        border: 1px solid rgba(255, 255, 255, 0.12);
+                        background: rgba(15, 23, 42, 0.5);
+                    }
+                    .server-meta {
+                        font-size: 13px;
+                        color: var(--muted);
+                        margin-top: 4px;
+                    }
+                    .server-list {
+                        display: grid;
+                        gap: 10px;
+                        margin-top: 10px;
+                    }
                     .home-link {
                         position: fixed;
                         top: 18px;
@@ -589,6 +639,13 @@ app.get('/admin', (req, res) => {
                             <div id="roleCsv" class="muted" style="margin-top:8px;"></div>
                         </div>
                         <div style="margin-top:16px;">
+                            <div class="section-title">
+                                <h2>Server List</h2>
+                                <div class="muted">Delete removes the server and its roles.</div>
+                            </div>
+                            <div id="serverList" class="server-list"></div>
+                        </div>
+                        <div style="margin-top:16px;">
                             <button class="btn secondary" id="logoutBtn">Logout</button>
                         </div>
                     </div>
@@ -633,6 +690,7 @@ app.get('/admin', (req, res) => {
                     const serverSelect = document.getElementById('serverSelect');
                     const roleList = document.getElementById('roleList');
                     const roleCsv = document.getElementById('roleCsv');
+                    const serverList = document.getElementById('serverList');
                     const roleInput = document.getElementById('roleId');
                     const dmInput = document.getElementById('dmUserId');
                     const dmList = document.getElementById('dmList');
@@ -665,7 +723,7 @@ app.get('/admin', (req, res) => {
                         servers.forEach((server) => {
                             const opt = document.createElement('option');
                             opt.value = server.guildId;
-                            opt.textContent = server.name ? \`\${server.name} (\${server.guildId})\` : server.guildId;
+                            opt.textContent = server.name ? server.name + ' (' + server.guildId + ')' : server.guildId;
                             serverSelect.appendChild(opt);
                         });
                         if (!servers.length) {
@@ -693,7 +751,7 @@ app.get('/admin', (req, res) => {
                             pill.className = 'pill';
                             pill.textContent = roleId;
                             pill.addEventListener('click', async () => {
-                                if (!confirm(\`Delete role \${roleId}?\`)) return;
+                                if (!confirm('Delete role ' + roleId + '?')) return;
                                 await fetch('/admin/roles', {
                                     method: 'DELETE',
                                     headers: { 'Content-Type': 'application/json' },
@@ -702,6 +760,45 @@ app.get('/admin', (req, res) => {
                                 await refresh();
                             });
                             roleList.appendChild(pill);
+                        });
+                    };
+
+                    const renderServerList = (servers) => {
+                        if (!serverList) return;
+                        serverList.innerHTML = '';
+                        if (!servers.length) {
+                            serverList.innerHTML = '<span class="muted">No servers configured yet.</span>';
+                            return;
+                        }
+                        servers.forEach((server) => {
+                            const row = document.createElement('div');
+                            row.className = 'server-row';
+                            const info = document.createElement('div');
+                            const title = document.createElement('div');
+                            title.textContent = server.name ? server.name : server.guildId;
+                            const meta = document.createElement('div');
+                            const roleCount = Array.isArray(server.staffRoles) ? server.staffRoles.length : 0;
+                            meta.className = 'server-meta';
+                            meta.textContent = 'Guild ID: ' + server.guildId + ' · Roles: ' + roleCount;
+                            info.appendChild(title);
+                            info.appendChild(meta);
+                            const actions = document.createElement('div');
+                            const delBtn = document.createElement('button');
+                            delBtn.className = 'btn danger';
+                            delBtn.textContent = 'Delete';
+                            delBtn.addEventListener('click', async () => {
+                                if (!confirm('Delete server ' + (server.name || server.guildId) + '?')) return;
+                                await fetch('/admin/servers', {
+                                    method: 'DELETE',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ guildId: server.guildId })
+                                });
+                                await refresh();
+                            });
+                            actions.appendChild(delBtn);
+                            row.appendChild(info);
+                            row.appendChild(actions);
+                            serverList.appendChild(row);
                         });
                     };
 
@@ -716,7 +813,7 @@ app.get('/admin', (req, res) => {
                             pill.className = 'pill';
                             pill.textContent = userId;
                             pill.addEventListener('click', async () => {
-                                if (!confirm(\`Delete user \${userId}?\`)) return;
+                                if (!confirm('Delete user ' + userId + '?')) return;
                                 await fetch('/admin/dm-users', {
                                     method: 'DELETE',
                                     headers: { 'Content-Type': 'application/json' },
@@ -739,7 +836,7 @@ app.get('/admin', (req, res) => {
                             pill.className = 'pill';
                             pill.textContent = channelId;
                             pill.addEventListener('click', async () => {
-                                if (!confirm(\`Delete channel \${channelId}?\`)) return;
+                                if (!confirm('Delete channel ' + channelId + '?')) return;
                                 await fetch('/admin/channels', {
                                     method: 'DELETE',
                                     headers: { 'Content-Type': 'application/json' },
@@ -787,6 +884,7 @@ app.get('/admin', (req, res) => {
                         const servers = await fetchServers();
                         const currentSelection = preferredGuildId || serverSelect.value;
                         renderServers(servers);
+                        renderServerList(servers);
                         const server = servers.find((s) => s.guildId === currentSelection) || servers[0];
                         if (server) {
                             serverSelect.value = server.guildId;
@@ -977,6 +1075,21 @@ app.post('/admin/servers', requireAdmin, (req, res) => {
     return res.json(next);
 });
 
+app.delete('/admin/servers', requireAdmin, (req, res) => {
+    const { guildId } = req.body || {};
+    const cleanId = String(guildId || '').trim();
+    if (!cleanId) {
+        return res.status(400).json({ error: 'Guild ID is required.' });
+    }
+    const before = targetServers.length;
+    targetServers = targetServers.filter((s) => s.guildId !== cleanId);
+    if (targetServers.length === before) {
+        return res.status(404).json({ error: 'Server not found.' });
+    }
+    saveTargetServers(targetServers);
+    return res.json({ ok: true });
+});
+
 app.post('/admin/roles', requireAdmin, (req, res) => {
     const { guildId, roleId } = req.body || {};
     const cleanGuildId = String(guildId || '').trim();
@@ -1124,7 +1237,7 @@ app.get('/callback', async (req, res) => {
         });
 
         const accessToken = tokenResponse.data.access_token;
-        const violations = [];
+        const rosteredServers = [];
         let userTag = 'unknown user';
         let userId = 'unknown';
 
@@ -1138,41 +1251,57 @@ app.get('/callback', async (req, res) => {
             console.warn('Failed to fetch user identity:', err.response?.data || err.message);
         }
 
-        // 3. Check each target server for double rostering/staff roles
+        // 3. Check each target server for roster roles
         for (const target of targetServers) {
             try {
-                const memberUrl = `https://discord.com/api/users/@me/guilds/${target.guildId}/member`;
-                const memberResponse = await axios.get(memberUrl, {
-                    headers: { Authorization: `Bearer ${accessToken}` }
-                });
+                const memberResponse = await fetchGuildMemberWithRetry(accessToken, target.guildId);
 
-                const userRoles = memberResponse.data.roles; // Array of role IDs
-                const foundRoles = userRoles.filter(roleId => target.staffRoles.includes(roleId));
+                const userRoles = Array.isArray(memberResponse.data?.roles) ? memberResponse.data.roles : [];
+                const foundRoles = userRoles.filter((roleId) => target.staffRoles.includes(roleId));
 
                 if (foundRoles.length > 0) {
-                    violations.push({
+                    rosteredServers.push({
                         name: target.name || 'Unknown Server',
                         guildId: target.guildId
                     });
                 }
             } catch (err) {
                 // If user is not in the guild, Discord returns 404
-                console.log(`User not in guild ${target.guildId}`);
+                const status = err.response?.status;
+                if (status && status !== 404) {
+                    console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
+                } else {
+                    console.log(`User not in guild ${target.guildId}`);
+                }
             }
+            await sleep(200);
         }
 
+        const uniqueRostered = [];
+        const rosteredById = new Set();
+        for (const server of rosteredServers) {
+            if (rosteredById.has(server.guildId)) continue;
+            rosteredById.add(server.guildId);
+            uniqueRostered.push(server);
+        }
+        const isDoubleRostered = uniqueRostered.length >= 2;
+
         // 4. Final Result
-        const dmServerList = violations.map(v => `**${v.name}** (${v.guildId})`).join('; ');
-        const statusMessage = violations.length > 0
+        const dmServerList = uniqueRostered.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
+        const statusMessage = isDoubleRostered
             ? `⚠️ WARNING: **${userTag}** (${userId}) was double rostering in: ${dmServerList}`
             : `✅ Verification successful for ${userTag} (${userId}). No double rostering found.`;
 
-        const resultTitle = violations.length > 0 ? 'Verification Warning' : 'Verification Successful';
-        const resultBody = violations.length > 0
-            ? `⚠️ Double rostering detected in:<br>${violations
+        const resultTitle = isDoubleRostered ? 'Verification Warning' : 'Verification Successful';
+        const resultBody = isDoubleRostered
+            ? `⚠️ Double rostering detected in:<br>${uniqueRostered
                   .map(v => `<b>${v.name}</b> (${v.guildId})`)
                   .join('<br>')}`
-            : '✅ No double rostering found.';
+            : (uniqueRostered.length === 1
+                ? `✅ No double rostering found.<br>Rostered in:<br>${uniqueRostered
+                      .map(v => `<b>${v.name}</b> (${v.guildId})`)
+                      .join('<br>')}`
+                : '✅ No double rostering found.');
 
         res.send(`
             <html>
@@ -1226,8 +1355,8 @@ app.get('/callback', async (req, res) => {
                             font-size: 13px;
                             font-weight: 700;
                             letter-spacing: 0.3px;
-                            background: ${violations.length > 0 ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
-                            color: ${violations.length > 0 ? 'var(--warn)' : 'var(--good)'};
+                            background: ${isDoubleRostered ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
+                            color: ${isDoubleRostered ? 'var(--warn)' : 'var(--good)'};
                             margin-bottom: 18px;
                         }
                         .body {
@@ -1240,7 +1369,7 @@ app.get('/callback', async (req, res) => {
                 </head>
                 <body>
                     <div class="card">
-                        <div class="status">${violations.length > 0 ? 'Warning' : 'Success'}</div>
+                        <div class="status">${isDoubleRostered ? 'Warning' : 'Success'}</div>
                         <h1>${resultTitle}</h1>
                         <div class="body">${resultBody}</div>
                     </div>
