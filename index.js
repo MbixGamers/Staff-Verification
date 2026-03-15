@@ -1370,31 +1370,32 @@ app.get('/callback', async (req, res) => {
                 uniqueRostered.push(server);
             }
             const isDoubleRostered = uniqueRostered.length >= 2;
+            const isRostered = uniqueRostered.length > 0;
 
             const hasFailures = failedServers.length > 0;
             const failedList = failedServers.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
             const dmServerList = uniqueRostered.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
             const statusMessage = hasFailures
                 ? `⚠️ Verification incomplete for **${userTag}** (${userId}). Could not verify: ${failedList}`
-                : (uniqueRostered.length > 0
+                : (isRostered
                     ? (isDoubleRostered
                         ? `⚠️ WARNING: **${userTag}** (${userId}) is rostered in multiple servers: ${dmServerList}`
-                        : `✅ Verification complete for ${userTag} (${userId}). Rostered in: ${dmServerList}`)
+                        : `⚠️ WARNING: **${userTag}** (${userId}) is rostered in: ${dmServerList}`)
                     : `✅ Verification complete for ${userTag} (${userId}). Not rostered in any target server.`);
 
             const resultTitle = hasFailures
                 ? 'Verification Incomplete'
-                : (isDoubleRostered ? 'Verification Warning' : 'Verification Complete');
+                : (isRostered ? 'Verification Warning' : 'Verification Complete');
             const resultBody = hasFailures
                 ? `⚠️ Some servers could not be verified:<br>${failedServers
                       .map(v => `<b>${v.name}</b> (${v.guildId})`)
                       .join('<br>')}`
-                : (uniqueRostered.length > 0
+                : (isRostered
                     ? (isDoubleRostered
                         ? `⚠️ Rostered in multiple servers:<br>${uniqueRostered
                               .map(v => `<b>${v.name}</b> (${v.guildId})`)
                               .join('<br>')}`
-                        : `✅ Rostered in:<br>${uniqueRostered
+                        : `⚠️ Rostered in:<br>${uniqueRostered
                               .map(v => `<b>${v.name}</b> (${v.guildId})`)
                               .join('<br>')}`)
                     : '✅ Not rostered in any target server.');
@@ -1402,6 +1403,7 @@ app.get('/callback', async (req, res) => {
             scanResults.set(scanId, {
                 state: 'done',
                 isDoubleRostered,
+                isRostered,
                 resultTitle,
                 resultBody,
                 statusMessage,
@@ -1609,6 +1611,7 @@ app.get('/scan-result/:scanId', (req, res) => {
     const resultTitle = scan.resultTitle;
     const resultBody = scan.resultBody;
     const isDoubleRostered = Boolean(scan.isDoubleRostered);
+    const isRostered = Boolean(scan.isRostered);
     return res.send(`
         <html>
             <head>
@@ -1661,8 +1664,8 @@ app.get('/scan-result/:scanId', (req, res) => {
                         font-size: 13px;
                         font-weight: 700;
                         letter-spacing: 0.3px;
-                        background: ${isDoubleRostered ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
-                        color: ${isDoubleRostered ? 'var(--warn)' : 'var(--good)'};
+                        background: ${(isRostered || isDoubleRostered) ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
+                        color: ${(isRostered || isDoubleRostered) ? 'var(--warn)' : 'var(--good)'};
                         margin-bottom: 18px;
                     }
                     .body {
@@ -1675,7 +1678,7 @@ app.get('/scan-result/:scanId', (req, res) => {
             </head>
             <body>
                 <div class="card">
-                    <div class="status">${isDoubleRostered ? 'Warning' : 'Success'}</div>
+                    <div class="status">${(isRostered || isDoubleRostered) ? 'Warning' : 'Success'}</div>
                     <h1>${resultTitle}</h1>
                     <div class="body">${resultBody}</div>
                 </div>
