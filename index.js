@@ -142,6 +142,9 @@ const saveChannelRecipients = (recipients) => {
 
 let channelRecipients = loadChannelRecipients();
 const channelSendStatus = new Map();
+const scanResults = new Map();
+const SCAN_TTL_MS = 1000 * 60 * 10;
+const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 700;
 
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const adminSessions = new Map();
@@ -268,7 +271,7 @@ const recordChannelStatus = (channelId, ok, error) => {
     });
 };
 
-const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3) => {
+const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3, onRateLimit) => {
     const memberUrl = `https://discord.com/api/users/@me/guilds/${guildId}/member`;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
@@ -282,6 +285,9 @@ const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3) 
             if (status === 429) {
                 const waitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
                 console.warn(`Rate limited reading guild ${guildId}. Waiting ${waitMs}ms before retry.`);
+                if (typeof onRateLimit === 'function') {
+                    onRateLimit(waitMs);
+                }
                 await sleep(waitMs);
                 continue;
             }
@@ -291,6 +297,12 @@ const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 3) 
     const error = new Error('Rate limited too many times.');
     error.code = 429;
     throw error;
+};
+
+const scheduleScanCleanup = (scanId) => {
+    setTimeout(() => {
+        scanResults.delete(scanId);
+    }, SCAN_TTL_MS);
 };
 
 app.get('/', (req, res) => {
@@ -407,6 +419,7 @@ app.get('/', (req, res) => {
                 <div class="card">
                     <h1>Staff Verification</h1>
                     <p>Verify your roster status across approved servers and receive an instant result.</p>
+                    <p style="margin-top:8px;">Note: This action can take 8-10 minutes or longer due to Discord rate limits.</p>
                     <a class="button" href="/login">Login with Discord</a>
                     <div class="footer">Secure OAuth2 verification</div>
                 </div>
@@ -1224,7 +1237,6 @@ app.get('/callback', async (req, res) => {
 
     try {
         const redirectUri = getRedirectUri(req);
-        // Exchange code for an access token
         const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
             client_id: CLIENT_ID,
             client_secret: CLIENT_SECRET,
@@ -1237,76 +1249,150 @@ app.get('/callback', async (req, res) => {
         });
 
         const accessToken = tokenResponse.data.access_token;
-        const rosteredServers = [];
-        let userTag = 'unknown user';
-        let userId = 'unknown';
+        const scanId = crypto.randomBytes(16).toString('hex');
+        scanResults.set(scanId, {
+            state: 'running',
+            total: targetServers.length,
+            checked: 0,
+            current: null
+        });
+        scheduleScanCleanup(scanId);
 
-        try {
-            const meResponse = await axios.get('https://discord.com/api/users/@me', {
-                headers: { Authorization: `Bearer ${accessToken}` }
-            });
-            userId = meResponse.data.id;
-            userTag = `${meResponse.data.username || 'unknown user'}`;
-        } catch (err) {
-            console.warn('Failed to fetch user identity:', err.response?.data || err.message);
-        }
+        const runScan = async () => {
+            const rosteredServers = [];
+            let userTag = 'unknown user';
+            let userId = 'unknown';
 
-        // 3. Check each target server for roster roles
-        for (const target of targetServers) {
             try {
-                const memberResponse = await fetchGuildMemberWithRetry(accessToken, target.guildId);
-
-                const userRoles = Array.isArray(memberResponse.data?.roles) ? memberResponse.data.roles : [];
-                const foundRoles = userRoles.filter((roleId) => target.staffRoles.includes(roleId));
-
-                if (foundRoles.length > 0) {
-                    rosteredServers.push({
-                        name: target.name || 'Unknown Server',
-                        guildId: target.guildId
-                    });
-                }
+                const meResponse = await axios.get('https://discord.com/api/users/@me', {
+                    headers: { Authorization: `Bearer ${accessToken}` }
+                });
+                userId = meResponse.data.id;
+                userTag = `${meResponse.data.username || 'unknown user'}`;
             } catch (err) {
-                // If user is not in the guild, Discord returns 404
-                const status = err.response?.status;
-                if (status && status !== 404) {
-                    console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
-                } else {
-                    console.log(`User not in guild ${target.guildId}`);
-                }
+                console.warn('Failed to fetch user identity:', err.response?.data || err.message);
             }
-            await sleep(200);
-        }
 
-        const uniqueRostered = [];
-        const rosteredById = new Set();
-        for (const server of rosteredServers) {
-            if (rosteredById.has(server.guildId)) continue;
-            rosteredById.add(server.guildId);
-            uniqueRostered.push(server);
-        }
-        const isDoubleRostered = uniqueRostered.length >= 2;
+            let checked = 0;
+            for (const target of targetServers) {
+                const currentLabel = target.name || target.guildId;
+                scanResults.set(scanId, {
+                    state: 'running',
+                    total: targetServers.length,
+                    checked,
+                    current: currentLabel
+                });
+                try {
+                    const memberResponse = await fetchGuildMemberWithRetry(
+                        accessToken,
+                        target.guildId,
+                        3,
+                        (waitMs) => {
+                            scanResults.set(scanId, {
+                                state: 'paused',
+                                total: targetServers.length,
+                                checked,
+                                current: currentLabel,
+                                resumeAt: Date.now() + waitMs
+                            });
+                        }
+                    );
+                    const userRoles = Array.isArray(memberResponse.data?.roles) ? memberResponse.data.roles : [];
+                    const foundRoles = userRoles.filter((roleId) => target.staffRoles.includes(roleId));
+                    if (foundRoles.length > 0) {
+                        rosteredServers.push({
+                            name: target.name || 'Unknown Server',
+                            guildId: target.guildId
+                        });
+                    }
+                } catch (err) {
+                    const status = err.response?.status;
+                    if (status && status !== 404) {
+                        console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
+                    } else {
+                        console.log(`User not in guild ${target.guildId}`);
+                    }
+                }
+                await sleep(GUILD_SCAN_DELAY_MS);
+                checked += 1;
+                scanResults.set(scanId, {
+                    state: 'running',
+                    total: targetServers.length,
+                    checked,
+                    current: currentLabel
+                });
+            }
 
-        // 4. Final Result
-        const dmServerList = uniqueRostered.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
-        const statusMessage = isDoubleRostered
-            ? `⚠️ WARNING: **${userTag}** (${userId}) was double rostering in: ${dmServerList}`
-            : `✅ Verification successful for ${userTag} (${userId}). No double rostering found.`;
+            const uniqueRostered = [];
+            const rosteredById = new Set();
+            for (const server of rosteredServers) {
+                if (rosteredById.has(server.guildId)) continue;
+                rosteredById.add(server.guildId);
+                uniqueRostered.push(server);
+            }
+            const isDoubleRostered = uniqueRostered.length >= 2;
 
-        const resultTitle = isDoubleRostered ? 'Verification Warning' : 'Verification Successful';
-        const resultBody = isDoubleRostered
-            ? `⚠️ Double rostering detected in:<br>${uniqueRostered
-                  .map(v => `<b>${v.name}</b> (${v.guildId})`)
-                  .join('<br>')}`
-            : (uniqueRostered.length === 1
-                ? `✅ No double rostering found.<br>Rostered in:<br>${uniqueRostered
+            const dmServerList = uniqueRostered.map((v) => `**${v.name}** (${v.guildId})`).join('; ');
+            const statusMessage = isDoubleRostered
+                ? `⚠️ WARNING: **${userTag}** (${userId}) was double rostering in: ${dmServerList}`
+                : `✅ Verification successful for ${userTag} (${userId}). No double rostering found.`;
+
+            const resultTitle = isDoubleRostered ? 'Verification Warning' : 'Verification Successful';
+            const resultBody = isDoubleRostered
+                ? `⚠️ Double rostering detected in:<br>${uniqueRostered
                       .map(v => `<b>${v.name}</b> (${v.guildId})`)
                       .join('<br>')}`
-                : '✅ No double rostering found.');
+                : (uniqueRostered.length === 1
+                    ? `✅ No double rostering found.<br>Rostered in:<br>${uniqueRostered
+                          .map(v => `<b>${v.name}</b> (${v.guildId})`)
+                          .join('<br>')}`
+                    : '✅ No double rostering found.');
 
-        res.send(`
+            scanResults.set(scanId, {
+                state: 'done',
+                isDoubleRostered,
+                resultTitle,
+                resultBody,
+                statusMessage,
+                total: targetServers.length,
+                checked: targetServers.length,
+                current: null
+            });
+
+            if (channelRecipients.length > 0) {
+                for (const channelId of channelRecipients) {
+                    const result = await sendChannelMessageWithRetry(channelId, statusMessage);
+                    if (!result.ok) {
+                        console.warn(`Failed to post to channel ${channelId}:`, result.error);
+                        recordChannelStatus(channelId, false, result.error);
+                    } else {
+                        recordChannelStatus(channelId, true, null);
+                    }
+                    await sleep(250);
+                }
+            } else {
+                for (const recipientId of dmRecipients) {
+                    const result = await sendStatusDmWithRetry(recipientId, statusMessage);
+                    if (!result.ok) {
+                        console.warn(`Failed to DM ${recipientId}:`, result.error);
+                        recordDmStatus(recipientId, false, result.error);
+                    } else {
+                        recordDmStatus(recipientId, true, null);
+                    }
+                    await sleep(250);
+                }
+            }
+        };
+
+        runScan().catch((scanErr) => {
+            console.error('Error during verification:', scanErr.response?.data || scanErr.message);
+            scanResults.set(scanId, { state: 'error' });
+        });
+
+        return res.send(`
             <html>
                 <head>
-                    <title>${resultTitle}</title>
+                    <title>Scanning</title>
                     <style>
                         :root {
                             --bg-1: #0f172a;
@@ -1316,8 +1402,7 @@ app.get('/callback', async (req, res) => {
                             --card-border: rgba(255, 255, 255, 0.2);
                             --text: #e2e8f0;
                             --muted: #94a3b8;
-                            --good: #22c55e;
-                            --warn: #f59e0b;
+                            --accent: #38bdf8;
                         }
                         * { box-sizing: border-box; }
                         body {
@@ -1342,70 +1427,206 @@ app.get('/callback', async (req, res) => {
                             text-align: center;
                             backdrop-filter: blur(12px);
                         }
-                        h1 {
-                            margin: 0 0 10px 0;
-                            font-size: 28px;
+                        h1 { margin: 0 0 10px 0; font-size: 28px; }
+                        p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
+                        .pulse {
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 50%;
+                            background: var(--accent);
+                            margin: 18px auto 0;
+                            box-shadow: 0 0 0 rgba(56, 189, 248, 0.5);
+                            animation: pulse 1.6s infinite;
                         }
-                        .status {
-                            display: inline-flex;
-                            align-items: center;
-                            gap: 10px;
-                            padding: 8px 14px;
+                        .progress {
+                            width: 100%;
+                            height: 10px;
                             border-radius: 999px;
-                            font-size: 13px;
-                            font-weight: 700;
-                            letter-spacing: 0.3px;
-                            background: ${isDoubleRostered ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
-                            color: ${isDoubleRostered ? 'var(--warn)' : 'var(--good)'};
-                            margin-bottom: 18px;
+                            background: rgba(148, 163, 184, 0.2);
+                            overflow: hidden;
+                            margin-top: 16px;
                         }
-                        .body {
-                            color: var(--muted);
-                            font-size: 15px;
-                            line-height: 1.6;
+                        .progress-bar {
+                            height: 100%;
+                            width: 0%;
+                            background: linear-gradient(120deg, #38bdf8, #22d3ee);
+                            transition: width 250ms ease;
                         }
-                        .body b { color: var(--text); }
+                        @keyframes pulse {
+                            0% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.55); }
+                            70% { box-shadow: 0 0 0 16px rgba(56, 189, 248, 0); }
+                            100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0); }
+                        }
                     </style>
                 </head>
                 <body>
                     <div class="card">
-                        <div class="status">${isDoubleRostered ? 'Warning' : 'Success'}</div>
-                        <h1>${resultTitle}</h1>
-                        <div class="body">${resultBody}</div>
+                        <h1>Scanning servers</h1>
+                        <p>Please keep this tab open until the scan is completed.</p>
+                        <p style="margin-top:8px;">Note: This action can take 8-10 minutes or longer due to Discord rate limits.</p>
+                        <p id="scanProgress" style="margin-top:12px;">Preparing scan…</p>
+                        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+                            <div class="progress-bar" id="scanBar"></div>
+                        </div>
+                        <div class="pulse" aria-hidden="true"></div>
                     </div>
+                    <script>
+                        const scanId = '${scanId}';
+                        const progressEl = document.getElementById('scanProgress');
+                        const barEl = document.getElementById('scanBar');
+                        const poll = async () => {
+                            try {
+                                const res = await fetch('/scan-status/' + scanId);
+                                if (!res.ok) return setTimeout(poll, 1500);
+                                const data = await res.json();
+                                if (progressEl && (data.state === 'running' || data.state === 'paused')) {
+                                    const total = Number(data.total || 0);
+                                    const checked = Number(data.checked || 0);
+                                    const current = data.current ? 'Checking: ' + data.current : 'Scanning...';
+                                    if (data.state === 'paused') {
+                                        const resumeAt = Number(data.resumeAt || 0);
+                                        const waitSeconds = resumeAt > Date.now()
+                                            ? Math.ceil((resumeAt - Date.now()) / 1000)
+                                            : 0;
+                                        progressEl.textContent = 'Paused due to rate limits. Resuming in ' + waitSeconds + 's.';
+                                    } else {
+                                        progressEl.textContent = total > 0
+                                            ? current + ' (' + checked + '/' + total + ')'
+                                            : current;
+                                    }
+                                    if (barEl && total > 0) {
+                                        const pct = Math.min(100, Math.round((checked / total) * 100));
+                                        barEl.style.width = pct + '%';
+                                        barEl.setAttribute('aria-valuenow', String(pct));
+                                    }
+                                }
+                                if (data.state === 'done' || data.state === 'error') {
+                                    if (barEl) {
+                                        barEl.style.width = '100%';
+                                        barEl.setAttribute('aria-valuenow', '100');
+                                    }
+                                    setTimeout(() => {
+                                        window.location.href = '/scan-result/' + scanId;
+                                    }, 500);
+                                    return;
+                                }
+                            } catch (err) {
+                                // ignore and keep polling
+                            }
+                            setTimeout(poll, 1500);
+                        };
+                        poll();
+                    </script>
                 </body>
             </html>
         `);
-
-        if (channelRecipients.length > 0) {
-            for (const channelId of channelRecipients) {
-                const result = await sendChannelMessageWithRetry(channelId, statusMessage);
-                if (!result.ok) {
-                    console.warn(`Failed to post to channel ${channelId}:`, result.error);
-                    recordChannelStatus(channelId, false, result.error);
-                } else {
-                    recordChannelStatus(channelId, true, null);
-                }
-                await sleep(250);
-            }
-        } else {
-            for (const recipientId of dmRecipients) {
-                const result = await sendStatusDmWithRetry(recipientId, statusMessage);
-                if (!result.ok) {
-                    console.warn(`Failed to DM ${recipientId}:`, result.error);
-                    recordDmStatus(recipientId, false, result.error);
-                } else {
-                    recordDmStatus(recipientId, true, null);
-                }
-                // Small delay to reduce bursty rate limits
-                await sleep(250);
-            }
-        }
-
     } catch (error) {
         console.error('Error during verification:', error.response?.data || error.message);
-        res.status(500).send('An error occurred during verification.');
+        return res.status(500).send('An error occurred during verification.');
     }
+});
+
+app.get('/scan-status/:scanId', (req, res) => {
+    const scan = scanResults.get(req.params.scanId);
+    if (!scan) {
+        return res.status(404).json({ state: 'missing' });
+    }
+    return res.json({
+        state: scan.state,
+        total: scan.total || 0,
+        checked: scan.checked || 0,
+        current: scan.current || null,
+        resumeAt: scan.resumeAt || null
+    });
+});
+
+app.get('/scan-result/:scanId', (req, res) => {
+    const scan = scanResults.get(req.params.scanId);
+    if (!scan) {
+        return res.status(404).send('Scan expired or not found.');
+    }
+    if (scan.state === 'error') {
+        return res.status(500).send('An error occurred during verification.');
+    }
+    if (scan.state !== 'done') {
+        return res.redirect(`/scan-status/${req.params.scanId}`);
+    }
+    const resultTitle = scan.resultTitle;
+    const resultBody = scan.resultBody;
+    const isDoubleRostered = Boolean(scan.isDoubleRostered);
+    return res.send(`
+        <html>
+            <head>
+                <title>${resultTitle}</title>
+                <style>
+                    :root {
+                        --bg-1: #0f172a;
+                        --bg-2: #0b2f4b;
+                        --bg-3: #113d5c;
+                        --card: rgba(255, 255, 255, 0.08);
+                        --card-border: rgba(255, 255, 255, 0.2);
+                        --text: #e2e8f0;
+                        --muted: #94a3b8;
+                        --good: #22c55e;
+                        --warn: #f59e0b;
+                    }
+                    * { box-sizing: border-box; }
+                    body {
+                        margin: 0;
+                        min-height: 100vh;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        background: radial-gradient(1200px circle at 20% 10%, #1e3a8a 0%, transparent 55%),
+                                    radial-gradient(1000px circle at 80% 20%, #0ea5e9 0%, transparent 45%),
+                                    linear-gradient(135deg, var(--bg-1), var(--bg-2), var(--bg-3));
+                        color: var(--text);
+                        font-family: "Sora", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+                    }
+                    .card {
+                        width: min(640px, 92vw);
+                        padding: 40px 36px;
+                        border-radius: 16px;
+                        background: var(--card);
+                        border: 1px solid var(--card-border);
+                        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+                        text-align: center;
+                        backdrop-filter: blur(12px);
+                    }
+                    h1 {
+                        margin: 0 0 10px 0;
+                        font-size: 28px;
+                    }
+                    .status {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 10px;
+                        padding: 8px 14px;
+                        border-radius: 999px;
+                        font-size: 13px;
+                        font-weight: 700;
+                        letter-spacing: 0.3px;
+                        background: ${isDoubleRostered ? 'rgba(245, 158, 11, 0.2)' : 'rgba(34, 197, 94, 0.2)'};
+                        color: ${isDoubleRostered ? 'var(--warn)' : 'var(--good)'};
+                        margin-bottom: 18px;
+                    }
+                    .body {
+                        color: var(--muted);
+                        font-size: 15px;
+                        line-height: 1.6;
+                    }
+                    .body b { color: var(--text); }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <div class="status">${isDoubleRostered ? 'Warning' : 'Success'}</div>
+                    <h1>${resultTitle}</h1>
+                    <div class="body">${resultBody}</div>
+                </div>
+            </body>
+        </html>
+    `);
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running at http://localhost:${PORT}`));
