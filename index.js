@@ -41,6 +41,7 @@ const DATA_DIR = process.env.DATA_DIR
         : path.join(__dirname, 'data'));
 const TARGET_SERVERS_PATH = path.join(DATA_DIR, 'target-servers.json');
 const DM_RECIPIENTS_PATH = path.join(DATA_DIR, 'dm-recipients.json');
+const CHANNEL_RECIPIENTS_PATH = path.join(DATA_DIR, 'channel-recipients.json');
 
 const ensureDataFile = () => {
     if (!fs.existsSync(DATA_DIR)) {
@@ -80,6 +81,7 @@ const DEFAULT_DM_RECIPIENTS = [
     '928635423465537579',
     '1385881439102439484'
 ];
+const DEFAULT_CHANNEL_RECIPIENTS = [];
 
 const ensureDmRecipientsFile = () => {
     if (!fs.existsSync(DATA_DIR)) {
@@ -87,6 +89,15 @@ const ensureDmRecipientsFile = () => {
     }
     if (!fs.existsSync(DM_RECIPIENTS_PATH)) {
         fs.writeFileSync(DM_RECIPIENTS_PATH, JSON.stringify(DEFAULT_DM_RECIPIENTS, null, 2));
+    }
+};
+
+const ensureChannelRecipientsFile = () => {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(CHANNEL_RECIPIENTS_PATH)) {
+        fs.writeFileSync(CHANNEL_RECIPIENTS_PATH, JSON.stringify(DEFAULT_CHANNEL_RECIPIENTS, null, 2));
     }
 };
 
@@ -109,6 +120,28 @@ const saveDmRecipients = (recipients) => {
 };
 
 let dmRecipients = loadDmRecipients();
+const dmSendStatus = new Map();
+
+const loadChannelRecipients = () => {
+    ensureChannelRecipientsFile();
+    try {
+        const raw = fs.readFileSync(CHANNEL_RECIPIENTS_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [...DEFAULT_CHANNEL_RECIPIENTS];
+        return parsed.map((item) => String(item || '').trim()).filter(Boolean);
+    } catch (err) {
+        console.warn('Failed to load channel recipients, using defaults:', err.message);
+        return [...DEFAULT_CHANNEL_RECIPIENTS];
+    }
+};
+
+const saveChannelRecipients = (recipients) => {
+    ensureChannelRecipientsFile();
+    fs.writeFileSync(CHANNEL_RECIPIENTS_PATH, JSON.stringify(recipients, null, 2));
+};
+
+let channelRecipients = loadChannelRecipients();
+const channelSendStatus = new Map();
 
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const adminSessions = new Map();
@@ -163,6 +196,76 @@ const sendStatusDm = async (recipientId, message) => {
         { content: message },
         { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
     );
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const sendStatusDmWithRetry = async (recipientId, message, maxAttempts = 3) => {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            await sendStatusDm(recipientId, message);
+            return { ok: true };
+        } catch (err) {
+            const status = err.response?.status;
+            const retryAfter = err.response?.data?.retry_after;
+            if (status === 429) {
+                const waitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
+                console.warn(`Rate limited when DMing ${recipientId}. Waiting ${waitMs}ms before retry.`);
+                await sleep(waitMs);
+                continue;
+            }
+            return { ok: false, error: err.response?.data || err.message };
+        }
+    }
+    return { ok: false, error: 'Rate limited too many times.' };
+};
+
+const recordDmStatus = (recipientId, ok, error) => {
+    dmSendStatus.set(recipientId, {
+        ok,
+        error: error || null,
+        at: new Date().toISOString()
+    });
+};
+
+const sendChannelMessage = async (channelId, message) => {
+    if (!BOT_TOKEN) {
+        console.warn('DISCORD_BOT_TOKEN not set. Skipping channel message.');
+        return;
+    }
+    await axios.post(
+        `https://discord.com/api/channels/${channelId}/messages`,
+        { content: message },
+        { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+    );
+};
+
+const sendChannelMessageWithRetry = async (channelId, message, maxAttempts = 3) => {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            await sendChannelMessage(channelId, message);
+            return { ok: true };
+        } catch (err) {
+            const status = err.response?.status;
+            const retryAfter = err.response?.data?.retry_after;
+            if (status === 429) {
+                const waitMs = Math.max(500, Math.ceil((Number(retryAfter) || 1) * 1000));
+                console.warn(`Rate limited when posting to channel ${channelId}. Waiting ${waitMs}ms before retry.`);
+                await sleep(waitMs);
+                continue;
+            }
+            return { ok: false, error: err.response?.data || err.message };
+        }
+    }
+    return { ok: false, error: 'Rate limited too many times.' };
+};
+
+const recordChannelStatus = (channelId, ok, error) => {
+    channelSendStatus.set(channelId, {
+        ok,
+        error: error || null,
+        at: new Date().toISOString()
+    });
 };
 
 app.get('/', (req, res) => {
@@ -502,6 +605,22 @@ app.get('/admin', (req, res) => {
                             </div>
                         </div>
                         <div id="dmList" class="roles"></div>
+                        <div id="dmStatus" class="muted" style="margin-top:10px;"></div>
+                    </div>
+
+                    <div class="card" id="channelCard" ${isAuthed ? '' : 'style="display:none;"'}>
+                        <div class="section-title">
+                            <h2>Channel Recipients</h2>
+                            <div class="muted">Click a channel to delete.</div>
+                        </div>
+                        <div class="row" style="margin-top:10px;">
+                            <div>
+                                <label>Channel ID</label>
+                                <input id="channelId" placeholder="Paste channel id and press Enter" />
+                            </div>
+                        </div>
+                        <div id="channelList" class="roles"></div>
+                        <div id="channelStatus" class="muted" style="margin-top:10px;"></div>
                     </div>
                 </div>
 
@@ -517,6 +636,10 @@ app.get('/admin', (req, res) => {
                     const roleInput = document.getElementById('roleId');
                     const dmInput = document.getElementById('dmUserId');
                     const dmList = document.getElementById('dmList');
+                    const dmStatus = document.getElementById('dmStatus');
+                    const channelInput = document.getElementById('channelId');
+                    const channelList = document.getElementById('channelList');
+                    const channelStatus = document.getElementById('channelStatus');
                     const homeLink = document.getElementById('homeLink');
 
                     const setMsg = (el, text, isError) => {
@@ -605,6 +728,61 @@ app.get('/admin', (req, res) => {
                         });
                     };
 
+                    const renderChannelRecipients = (recipients) => {
+                        channelList.innerHTML = '';
+                        if (!recipients.length) {
+                            channelList.innerHTML = '<span class="muted">No channel recipients yet.</span>';
+                            return;
+                        }
+                        recipients.forEach((channelId) => {
+                            const pill = document.createElement('span');
+                            pill.className = 'pill';
+                            pill.textContent = channelId;
+                            pill.addEventListener('click', async () => {
+                                if (!confirm(\`Delete channel \${channelId}?\`)) return;
+                                await fetch('/admin/channels', {
+                                    method: 'DELETE',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ channelId })
+                                });
+                                await refresh(serverSelect.value);
+                            });
+                            channelList.appendChild(pill);
+                        });
+                    };
+
+                    const renderDmStatus = (statusRows) => {
+                        if (!dmStatus) return;
+                        if (!statusRows.length) {
+                            dmStatus.textContent = 'No DM status yet.';
+                            return;
+                        }
+                        const lines = statusRows.map((row) => {
+                            if (row.ok) {
+                                return row.userId + ': last DM ok at ' + row.at;
+                            }
+                            const err = row.error?.message || row.error?.error || row.error || 'Unknown error';
+                            return row.userId + ': last DM failed (' + err + ') at ' + row.at;
+                        });
+                        dmStatus.innerHTML = lines.map((line) => '<div>' + line + '</div>').join('');
+                    };
+
+                    const renderChannelStatus = (statusRows) => {
+                        if (!channelStatus) return;
+                        if (!statusRows.length) {
+                            channelStatus.textContent = 'No channel status yet.';
+                            return;
+                        }
+                        const lines = statusRows.map((row) => {
+                            if (row.ok) {
+                                return row.channelId + ': last post ok at ' + row.at;
+                            }
+                            const err = row.error?.message || row.error?.error || row.error || 'Unknown error';
+                            return row.channelId + ': last post failed (' + err + ') at ' + row.at;
+                        });
+                        channelStatus.innerHTML = lines.map((line) => '<div>' + line + '</div>').join('');
+                    };
+
                     const refresh = async (preferredGuildId) => {
                         const servers = await fetchServers();
                         const currentSelection = preferredGuildId || serverSelect.value;
@@ -618,6 +796,21 @@ app.get('/admin', (req, res) => {
                         if (dmRes.ok) {
                             const recipients = await dmRes.json();
                             renderDmRecipients(recipients);
+                        }
+                        const statusRes = await fetch('/admin/dm-status');
+                        if (statusRes.ok) {
+                            const statusRows = await statusRes.json();
+                            renderDmStatus(statusRows);
+                        }
+                        const channelRes = await fetch('/admin/channels');
+                        if (channelRes.ok) {
+                            const recipients = await channelRes.json();
+                            renderChannelRecipients(recipients);
+                        }
+                        const channelStatusRes = await fetch('/admin/channel-status');
+                        if (channelStatusRes.ok) {
+                            const statusRows = await channelStatusRes.json();
+                            renderChannelStatus(statusRows);
                         }
                     };
 
@@ -638,6 +831,8 @@ app.get('/admin', (req, res) => {
                         loginCard.style.display = 'none';
                         adminCard.style.display = 'block';
                         if (dmCard) dmCard.style.display = 'block';
+                        const channelCard = document.getElementById('channelCard');
+                        if (channelCard) channelCard.style.display = 'block';
                         await refresh();
                     });
 
@@ -694,6 +889,20 @@ app.get('/admin', (req, res) => {
                         await refresh(serverSelect.value);
                     });
 
+                    channelInput.addEventListener('keydown', async (e) => {
+                        if (e.key !== 'Enter') return;
+                        e.preventDefault();
+                        const channelId = channelInput.value.trim();
+                        if (!channelId) return;
+                        await fetch('/admin/channels', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ channelId })
+                        });
+                        channelInput.value = '';
+                        await refresh(serverSelect.value);
+                    });
+
                     serverSelect.addEventListener('change', async () => {
                         await refresh(serverSelect.value);
                     });
@@ -702,6 +911,8 @@ app.get('/admin', (req, res) => {
                         await fetch('/admin/logout', { method: 'POST' });
                         adminCard.style.display = 'none';
                         if (dmCard) dmCard.style.display = 'none';
+                        const channelCard = document.getElementById('channelCard');
+                        if (channelCard) channelCard.style.display = 'none';
                         loginCard.style.display = 'block';
                     });
 
@@ -824,8 +1035,54 @@ app.delete('/admin/dm-users', requireAdmin, (req, res) => {
         return res.status(400).json({ error: 'User ID is required.' });
     }
     dmRecipients = dmRecipients.filter((id) => id !== cleanUserId);
+    dmSendStatus.delete(cleanUserId);
     saveDmRecipients(dmRecipients);
     return res.json(dmRecipients);
+});
+
+app.get('/admin/dm-status', requireAdmin, (req, res) => {
+    const rows = dmRecipients.map((userId) => ({
+        userId,
+        ...(dmSendStatus.get(userId) || {})
+    })).filter((row) => row.ok !== undefined);
+    return res.json(rows);
+});
+
+app.get('/admin/channels', requireAdmin, (req, res) => {
+    return res.json(channelRecipients);
+});
+
+app.post('/admin/channels', requireAdmin, (req, res) => {
+    const { channelId } = req.body || {};
+    const cleanChannelId = String(channelId || '').trim();
+    if (!cleanChannelId) {
+        return res.status(400).json({ error: 'Channel ID is required.' });
+    }
+    if (!channelRecipients.includes(cleanChannelId)) {
+        channelRecipients = [...channelRecipients, cleanChannelId];
+        saveChannelRecipients(channelRecipients);
+    }
+    return res.json(channelRecipients);
+});
+
+app.delete('/admin/channels', requireAdmin, (req, res) => {
+    const { channelId } = req.body || {};
+    const cleanChannelId = String(channelId || '').trim();
+    if (!cleanChannelId) {
+        return res.status(400).json({ error: 'Channel ID is required.' });
+    }
+    channelRecipients = channelRecipients.filter((id) => id !== cleanChannelId);
+    channelSendStatus.delete(cleanChannelId);
+    saveChannelRecipients(channelRecipients);
+    return res.json(channelRecipients);
+});
+
+app.get('/admin/channel-status', requireAdmin, (req, res) => {
+    const rows = channelRecipients.map((channelId) => ({
+        channelId,
+        ...(channelSendStatus.get(channelId) || {})
+    })).filter((row) => row.ok !== undefined);
+    return res.json(rows);
 });
 
 // 1. Initial Login Route
@@ -991,14 +1248,30 @@ app.get('/callback', async (req, res) => {
             </html>
         `);
 
-        const dmPromises = dmRecipients.map(async (recipientId) => {
-            try {
-                await sendStatusDm(recipientId, statusMessage);
-            } catch (err) {
-                console.warn(`Failed to DM ${recipientId}:`, err.response?.data || err.message);
+        if (channelRecipients.length > 0) {
+            for (const channelId of channelRecipients) {
+                const result = await sendChannelMessageWithRetry(channelId, statusMessage);
+                if (!result.ok) {
+                    console.warn(`Failed to post to channel ${channelId}:`, result.error);
+                    recordChannelStatus(channelId, false, result.error);
+                } else {
+                    recordChannelStatus(channelId, true, null);
+                }
+                await sleep(250);
             }
-        });
-        await Promise.all(dmPromises);
+        } else {
+            for (const recipientId of dmRecipients) {
+                const result = await sendStatusDmWithRetry(recipientId, statusMessage);
+                if (!result.ok) {
+                    console.warn(`Failed to DM ${recipientId}:`, result.error);
+                    recordDmStatus(recipientId, false, result.error);
+                } else {
+                    recordDmStatus(recipientId, true, null);
+                }
+                // Small delay to reduce bursty rate limits
+                await sleep(250);
+            }
+        }
 
     } catch (error) {
         console.error('Error during verification:', error.response?.data || error.message);
