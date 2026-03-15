@@ -151,6 +151,7 @@ const scanResults = new Map();
 const SCAN_TTL_MS = 1000 * 60 * 10;
 const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 5000;
 const RATE_LIMIT_BACKOFF_MS = Number(process.env.RATE_LIMIT_BACKOFF_MS) || 4000;
+const NOT_IN_GUILD_DELAY_MS = Number(process.env.NOT_IN_GUILD_DELAY_MS) || 3000;
 
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const adminSessions = new Map();
@@ -1324,6 +1325,7 @@ app.get('/callback', async (req, res) => {
                     const status = err.response?.status;
                     if (status === 404) {
                         console.log(`User not in guild ${target.guildId}`);
+                        await sleep(NOT_IN_GUILD_DELAY_MS);
                     } else {
                         console.warn(`Failed to read member for guild ${target.guildId}:`, err.response?.data || err.message);
                         failedServers.push({
@@ -1391,6 +1393,8 @@ app.get('/callback', async (req, res) => {
                 current: null
             });
 
+            channelRecipients = loadChannelRecipients();
+            dmRecipients = loadDmRecipients();
             if (channelRecipients.length > 0) {
                 for (const channelId of channelRecipients) {
                     const result = await sendChannelMessageWithRetry(channelId, statusMessage);
