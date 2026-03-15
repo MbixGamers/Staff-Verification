@@ -149,7 +149,7 @@ let channelRecipients = loadChannelRecipients();
 const channelSendStatus = new Map();
 const scanResults = new Map();
 const SCAN_TTL_MS = 1000 * 60 * 10;
-const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 5000;
+const GUILD_SCAN_DELAY_MS = Number(process.env.GUILD_SCAN_DELAY_MS) || 60000;
 const RATE_LIMIT_BACKOFF_MS = Number(process.env.RATE_LIMIT_BACKOFF_MS) || 4000;
 const NOT_IN_GUILD_DELAY_MS = Number(process.env.NOT_IN_GUILD_DELAY_MS) || 3000;
 
@@ -278,10 +278,11 @@ const recordChannelStatus = (channelId, ok, error) => {
     });
 };
 
-const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 5, onRateLimit) => {
+const fetchGuildMemberWithRetry = async (accessToken, guildId, onRateLimit) => {
     const memberUrl = `https://discord.com/api/users/@me/guilds/${guildId}/member`;
     let extraBackoff = 0;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let attempt = 1;
+    while (true) {
         try {
             const response = await axios.get(memberUrl, {
                 headers: { Authorization: `Bearer ${accessToken}` }
@@ -299,14 +300,12 @@ const fetchGuildMemberWithRetry = async (accessToken, guildId, maxAttempts = 5, 
                 }
                 await sleep(waitMs);
                 extraBackoff = Math.min(RATE_LIMIT_BACKOFF_MS * attempt, 10000);
+                attempt += 1;
                 continue;
             }
             throw err;
         }
     }
-    const error = new Error('Rate limited too many times.');
-    error.code = 429;
-    throw error;
 };
 
 const scheduleScanCleanup = (scanId) => {
@@ -429,7 +428,7 @@ app.get('/', (req, res) => {
                 <div class="card">
                     <h1>Staff Verification</h1>
                     <p>Verify your roster status across approved servers and receive an instant result.</p>
-                    <p style="margin-top:8px;">Note: This action can take 15+ minutes due to Discord rate limits.</p>
+                    <p style="margin-top:8px;">Note: This action can take 1+ minute per server due to Discord rate limits.</p>
                     <a class="button" href="/login">Login with Discord</a>
                     <div class="footer">Secure OAuth2 verification</div>
                 </div>
@@ -1302,7 +1301,6 @@ app.get('/callback', async (req, res) => {
                     const memberResponse = await fetchGuildMemberWithRetry(
                         accessToken,
                         target.guildId,
-                        3,
                         (waitMs) => {
                             scanResults.set(scanId, {
                                 state: 'paused',
@@ -1499,7 +1497,7 @@ app.get('/callback', async (req, res) => {
                     <div class="card">
                         <h1>Scanning servers</h1>
                         <p>Please keep this tab open until the scan is completed.</p>
-                        <p style="margin-top:8px;">Note: This action can take 15+ minutes due to Discord rate limits.</p>
+                        <p style="margin-top:8px;">Note: This action can take 1+ minute per server due to Discord rate limits.</p>
                         <p id="scanProgress" style="margin-top:12px;">Preparing scan…</p>
                         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
                             <div class="progress-bar" id="scanBar"></div>
